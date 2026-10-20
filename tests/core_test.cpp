@@ -1,0 +1,304 @@
+#include "core.hpp"
+
+#include <cerrno>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <unistd.h>
+
+using namespace busb;
+#define CHECK(condition)                                                                                     \
+    do {                                                                                                     \
+        if (!(condition))                                                                                    \
+            throw std::runtime_error(std::string(__func__) + ": " + #condition);                             \
+    } while (0)
+
+namespace {
+Device device(int address = 7) {
+    Device d;
+    d.port = "1-2.3";
+    d.bus = 1;
+    d.address = address;
+    d.name = "Test board";
+    d.vendor = "1234";
+    d.product = "5678";
+    d.dfu_interfaces = {2};
+    return d;
+}
+Event submission(uint64_t id = 1, bool input = false) {
+    Event e;
+    e.h.id = id;
+    e.h.type = 'S';
+    e.h.transfer = 3;
+    e.h.endpoint = input ? 0x81 : 1;
+    e.h.bus = 1;
+    e.h.device = 7;
+    e.h.seconds = 100;
+    e.h.status = -EINPROGRESS;
+    e.h.length = 1024;
+    e.h.setup_flag = '-';
+    return e;
+}
+Event completion(Event e, uint32_t actual = 512, int status = 0) {
+    e.h.type = 'C';
+    e.h.length = actual;
+    e.h.status = status;
+    e.h.micros += 2500;
+    e.h.setup_flag = '-';
+    e.h.setup.fill(0);
+    return e;
+}
+void bytes_counted_once() {
+    Model m;
+    m.devices({device()}, true);
+    auto s = submission();
+    m.ingest(s);
+    CHECK(m.total.out == 0);
+    CHECK(m.total.errors == 0);
+    CHECK(m.pending() == 1);
+    m.ingest(completion(s));
+    CHECK(m.total.out == 512);
+    CHECK(m.total.transfers == 1);
+    CHECK(m.total.errors == 0);
+    CHECK(m.pending() == 0);
+    CHECK(std::abs(m.total.latency_ms - 2.5) < 0.001);
+    auto input = submission(2, true);
+    m.ingest(input);
+    m.ingest(completion(input, 8));
+    CHECK(m.total.in == 8);
+    CHECK(m.ports.at("1-2.3").endpoints.at(0x81).in == 8);
+    m.sample(0.5);
+    CHECK(m.total.in_rate == 16);
+    CHECK(m.total.out_rate == 1024);
+    CHECK(m.total.transfer_rate == 4);
+    m.sample(0.5);
+    CHECK(m.total.in_rate == 0);
+    CHECK(m.total.out_rate == 0);
+}
+void errors_and_missing_submissions() {
+    Model m;
+    auto s = submission();
+    m.ingest(s);
+    m.ingest(completion(s, 0, -EPIPE));
+    CHECK(m.total.errors == 1);
+    CHECK(m.total.out == 0);
+    CHECK(status_name(-EPIPE) == "STALL");
+    auto orphan = completion(submission(2, true), 12);
+    m.ingest(orphan);
+    CHECK(m.unpaired == 1);
+    CHECK(m.total.in == 12);
+    auto failed = submission(3);
+    m.ingest(failed);
+    failed.h.type = 'E';
+    failed.h.status = -ENODEV;
+    m.ingest(failed);
+    CHECK(m.total.errors == 2);
+    CHECK(m.total.out == 0);
+    CHECK(m.pending() == 0);
+}
+void dfu_decoding() {
+    Model m;
+    auto d = device();
+    m.devices({d}, true);
+    auto s = submission();
+    s.h.transfer = 2;
+    s.h.endpoint = 0x80;
+    s.h.setup_flag = 0;
+    s.h.setup = {0xa1, 3, 0, 0, 2, 0, 6, 0};
+    CHECK(decode_setup(s.h, &d).starts_with("DFU_GETSTATUS"));
+    auto wrong = s;
+    wrong.h.setup[4] = 1;
+    CHECK(!decode_setup(wrong.h, &d).starts_with("DFU_"));
+    CHECK(decode_setup(wrong.h, nullptr, 1).starts_with("DFU_GETSTATUS"));
+    wrong.h.setup[0] = 0x21;
+    CHECK(!decode_setup(wrong.h, nullptr, 1).starts_with("DFU_"));
+    m.ingest(s);
+    auto c = completion(s, 6);
+    c.data = {0, 0x56, 0x34, 0x12, 4, 0};
+    c.h.captured = 6;
+    m.ingest(c);
+    CHECK(m.ports.at(d.port).dfu_status == "dfuDNBUSY OK poll=1193046ms");
+    CHECK(m.transfers.back().dfu);
+    CHECK(decode_dfu_status({0, 0}).starts_with("short"));
+    CHECK(decode_dfu_status({7, 0, 0, 0, 10, 0}).find("errVERIFY") != std::string::npos);
+    s.h.setup = {0x21, 1, 42, 0, 2, 0, 0, 0};
+    CHECK(decode_setup(s.h, &d).find("block=42 len=0 (manifest)") != std::string::npos);
+}
+void reenumeration_follows_port() {
+    Model m;
+    auto d = device();
+    m.devices({d}, true);
+    auto s = submission();
+    m.ingest(s);
+    m.devices({});
+    CHECK(!m.ports.at(d.port).device.connected);
+    auto new_d = device(9);
+    new_d.product = "df11";
+    m.devices({new_d});
+    CHECK(m.ports.at(d.port).reconnects == 1);
+    CHECK(m.ports.at(d.port).device.address == 9);
+    // An old in-flight callback still belongs to its original physical port.
+    m.ingest(completion(s, 20));
+    auto newer = submission(2);
+    newer.h.device = 9;
+    m.ingest(newer);
+    m.ingest(completion(newer, 30));
+    CHECK(m.ports.at(d.port).counters.out == 50);
+    CHECK(m.ports.size() == 1);
+    CHECK(m.lifecycle.back().starts_with("REENUMERATE"));
+}
+void correlation_and_retention() {
+    Model m;
+    auto a = submission();
+    auto b = a;
+    b.h.bus = 2;
+    m.ingest(a);
+    m.ingest(b);
+    m.ingest(completion(a));
+    CHECK(m.pending() == 1);
+    m.ingest(completion(b));
+    CHECK(m.pending() == 0);
+    m.ingest(submission(100));
+    auto late = submission(101);
+    late.h.seconds += 61;
+    m.ingest(late);
+    CHECK(m.expired == 1);
+    for (unsigned i = 0; i < 3000; ++i) {
+        auto e = submission(1000 + i);
+        e.h.seconds += 62;
+        m.ingest(e);
+        m.ingest(completion(e));
+    }
+    CHECK(m.transfers.size() == 2000);
+    CHECK(m.ports.begin()->second.transfers.size() <= 128);
+    for (int i = 0; i < 200; ++i)
+        m.sample(0.5);
+    CHECK(m.total.in_history.size() == 180);
+}
+struct TempDir {
+    std::filesystem::path path;
+    TempDir() {
+        char p[] = "/tmp/busb-test-XXXXXX";
+        auto *result = mkdtemp(p);
+        if (!result)
+            throw std::runtime_error("mkdtemp");
+        path = result;
+    }
+    ~TempDir() { std::filesystem::remove_all(path); }
+};
+void fixture(const std::filesystem::path &p, const std::string &value) {
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream(p) << value << '\n';
+}
+void sysfs_discovery() {
+    TempDir t;
+    auto p = t.path / "3-4";
+    fixture(p / "busnum", "3");
+    fixture(p / "devnum", "17");
+    fixture(p / "idVendor", "1234");
+    fixture(p / "idProduct", "5678");
+    fixture(p / "product", "Development board");
+    fixture(p / "speed", "480");
+    auto iface = p / "3-4:1.2";
+    fixture(iface / "bInterfaceClass", "fe");
+    fixture(iface / "bInterfaceSubClass", "01");
+    fixture(iface / "bInterfaceNumber", "02");
+    std::filesystem::create_directories(t.path / "usb3");
+    auto devices = scan_devices(t.path);
+    CHECK(devices.size() == 1);
+    CHECK(devices[0].port == "3-4");
+    CHECK(devices[0].address == 17);
+    CHECK(devices[0].dfu_interfaces == std::vector<int>{2});
+}
+void pcap_roundtrip_and_validation() {
+    TempDir t;
+    auto path = (t.path / "trace.pcap").string();
+    auto e = submission();
+    e.h.seconds = 0;
+    e.data = {1, 2, 3};
+    e.h.captured = 4096;
+    {
+        Recorder r(path);
+        r.write(e);
+    }
+    auto source = replay_source(path);
+    auto read = source->next();
+    CHECK(read.has_value());
+    CHECK(read->h.id == e.h.id);
+    CHECK(read->data == e.data);
+    CHECK(read->h.captured == 4096);
+    CHECK(!source->next());
+    CHECK(source->finished());
+    bool refused = false;
+    try {
+        Recorder r(path);
+    } catch (const std::exception &) {
+        refused = true;
+    }
+    CHECK(refused);
+    auto truncated = (t.path / "truncated.pcap").string();
+    std::filesystem::copy_file(path, truncated);
+    std::filesystem::resize_file(truncated, std::filesystem::file_size(truncated) - 1);
+    refused = false;
+    try {
+        auto broken = replay_source(truncated);
+        broken->next();
+    } catch (const std::exception &) {
+        refused = true;
+    }
+    CHECK(refused);
+    fixture(t.path / "bad.pcap", "not a capture");
+    refused = false;
+    try {
+        replay_source((t.path / "bad.pcap").string());
+    } catch (const std::exception &) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+void iso_preview_skips_descriptors() {
+    Model m;
+    auto e = completion(submission(1, true));
+    e.h.transfer = 0;
+    e.h.descriptors = 1;
+    e.data.assign(16, 0);
+    e.data.push_back(0xab);
+    e.h.captured = e.data.size();
+    m.ingest(e);
+    CHECK(m.transfers.back().payload == "ab");
+}
+void bulk_counters_exceed_four_gibibytes() {
+    Model m;
+    for (unsigned i = 0; i < 5000; ++i) {
+        auto s = submission(i, true);
+        s.h.length = 1024 * 1024;
+        m.ingest(s);
+        m.ingest(completion(s, s.h.length));
+    }
+    CHECK(m.total.in == uint64_t(5000) * 1024 * 1024);
+    CHECK(m.total.transfers == 5000);
+    CHECK(m.total.errors == 0);
+    CHECK(m.pending() == 0);
+    m.sample(1);
+    CHECK(m.total.in_rate > 4.0 * 1024 * 1024 * 1024);
+    CHECK(human(m.total.in_rate).find("GiB") != std::string::npos);
+}
+} // namespace
+int main() {
+    try {
+        bytes_counted_once();
+        errors_and_missing_submissions();
+        dfu_decoding();
+        reenumeration_follows_port();
+        correlation_and_retention();
+        sysfs_discovery();
+        pcap_roundtrip_and_validation();
+        iso_preview_skips_descriptors();
+        bulk_counters_exceed_four_gibibytes();
+        std::cout << "9 core scenarios passed\n";
+    } catch (const std::exception &e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
+}

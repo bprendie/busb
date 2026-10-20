@@ -1,0 +1,30 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make pkg-config libncurses-dev
+      - name: Build
+        run: make -j2
+      - name: Test USB event accounting and decoding
+        run: make test
+      - name: Smoke test without USB capture privileges
+        run: |
+          ./build/busb --version
+          ./build/busb --demo --headless --duration 1
+          ./build/busb --list
