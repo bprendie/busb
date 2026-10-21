@@ -21,7 +21,8 @@ void usage() {
                  "  --duration SECONDS   Stop after the given time\n"
                  "  --help / --version   Show help / version\n\n"
                  "Live capture: sudo modprobe usbmon; sudo ./build/busb\n"
-                 "Keys: ↑↓ select port, a scope, d DFU, e errors, h hex, Space freeze, ? help, q quit\n";
+                 "Keys: 1/2/3 layout, ↑↓ select, enter open, a scope, / find, d DFU, e errors,\n"
+                 "      t type, m direction, f endpoint, i idle, +/- rate, Space freeze, ? help, q quit\n";
 }
 double numeric(const std::string &s) {
     size_t end = 0;

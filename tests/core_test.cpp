@@ -1,5 +1,6 @@
 #include "core.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <fstream>
@@ -176,6 +177,52 @@ void correlation_and_retention() {
         m.sample(0.5);
     CHECK(m.total.in_history.size() == 180);
 }
+void recent_latency_and_last_error() {
+    Model m;
+    auto stalled = submission();
+    m.ingest(stalled);
+    m.ingest(completion(stalled, 0, -EPIPE));
+    m.sample(0.5);
+    CHECK(m.total.last_error == -EPIPE);
+    CHECK(status_name(m.total.last_error) == "STALL");
+    CHECK(m.total.window_max_latency_ms > 2);
+    auto ok = submission(2);
+    m.ingest(ok);
+    m.ingest(completion(ok, 8));
+    m.sample(0.5);
+    CHECK(m.total.last_error == 0);
+    CHECK(std::abs(m.total.window_latency_ms - 2.5) < 0.001);
+    CHECK(m.total.window_max_latency_ms < 3);
+}
+void mass_storage_command() {
+    std::vector<uint8_t> cbw(31, 0);
+    cbw[0] = 'U';
+    cbw[1] = 'S';
+    cbw[2] = 'B';
+    cbw[3] = 'C';
+    cbw[14] = 10;
+    cbw[15] = 0x28;
+    cbw[17] = 0x00;
+    cbw[18] = 0x10;
+    cbw[19] = 0x20;
+    cbw[20] = 0x30;
+    cbw[23] = 64;
+    CHECK(decode_bot(cbw) == "READ(10) LBA 0x102030 × 64");
+    cbw[15] = 0x2a;
+    CHECK(decode_bot(cbw).starts_with("WRITE(10) LBA 0x102030"));
+    cbw[0] = 0;
+    CHECK(decode_bot(cbw).empty());
+    cbw[0] = 'U';
+    cbw[15] = 0x28;
+    Model m;
+    auto s = submission();
+    s.data = cbw;
+    s.h.captured = s.data.size();
+    m.ingest(s);
+    m.ingest(completion(s, 31));
+    CHECK(m.transfers.back().description == "READ(10) LBA 0x102030 × 64");
+    CHECK(m.transfers.back().bytes[0] == 'U');
+}
 struct TempDir {
     std::filesystem::path path;
     TempDir() {
@@ -200,16 +247,75 @@ void sysfs_discovery() {
     fixture(p / "idProduct", "5678");
     fixture(p / "product", "Development board");
     fixture(p / "speed", "480");
+    fixture(p / "bDeviceClass", "00");
+    auto hid = p / "3-4:1.0";
+    fixture(hid / "bInterfaceClass", "03");
+    fixture(hid / "bInterfaceSubClass", "00");
+    fixture(hid / "bInterfaceNumber", "00");
     auto iface = p / "3-4:1.2";
     fixture(iface / "bInterfaceClass", "fe");
     fixture(iface / "bInterfaceSubClass", "01");
     fixture(iface / "bInterfaceNumber", "02");
+    auto hub = t.path / "3-1";
+    fixture(hub / "busnum", "3");
+    fixture(hub / "devnum", "1");
+    fixture(hub / "bDeviceClass", "09");
+    fixture(hub / "product", "USB hub");
+    fixture(hub / "speed", "480");
+    auto hub_if = hub / "3-1:1.0";
+    fixture(hub_if / "bInterfaceClass", "09");
+    fixture(hub_if / "bInterfaceSubClass", "00");
+    fixture(hub_if / "bInterfaceNumber", "00");
+    auto loader = t.path / "3-5";
+    fixture(loader / "busnum", "3");
+    fixture(loader / "devnum", "53");
+    fixture(loader / "idVendor", "2207");
+    fixture(loader / "idProduct", "262d");
+    fixture(loader / "speed", "480");
+    fixture(loader / "bDeviceClass", "00");
+    auto rock = loader / "3-5:1.0";
+    fixture(rock / "bInterfaceClass", "ff");
+    fixture(rock / "bInterfaceSubClass", "06");
+    fixture(rock / "bInterfaceProtocol", "05");
+    fixture(rock / "bInterfaceNumber", "00");
+    auto vendor = t.path / "3-6";
+    fixture(vendor / "busnum", "3");
+    fixture(vendor / "devnum", "8");
+    fixture(vendor / "idVendor", "06cb");
+    fixture(vendor / "idProduct", "0104");
+    fixture(vendor / "speed", "12");
+    fixture(vendor / "bDeviceClass", "ff");
+    auto vendor_if = vendor / "3-6:1.0";
+    fixture(vendor_if / "bInterfaceClass", "ff");
+    fixture(vendor_if / "bInterfaceSubClass", "00");
+    fixture(vendor_if / "bInterfaceProtocol", "00");
+    fixture(vendor_if / "bInterfaceNumber", "00");
     std::filesystem::create_directories(t.path / "usb3");
     auto devices = scan_devices(t.path);
-    CHECK(devices.size() == 1);
-    CHECK(devices[0].port == "3-4");
-    CHECK(devices[0].address == 17);
-    CHECK(devices[0].dfu_interfaces == std::vector<int>{2});
+    CHECK(devices.size() == 4);
+    auto board = std::find_if(devices.begin(), devices.end(), [](const Device &d) { return d.port == "3-4"; });
+    auto hub_device = std::find_if(devices.begin(), devices.end(), [](const Device &d) { return d.port == "3-1"; });
+    CHECK(board != devices.end());
+    CHECK(hub_device != devices.end());
+    CHECK(board->address == 17);
+    CHECK(board->dfu_interfaces == std::vector<int>{2});
+    CHECK(std::abs(board->megabits - 480) < 0.01);
+    CHECK(board->class_summary.find("HID") != std::string::npos);
+    CHECK(board->class_summary.find("DFU") != std::string::npos);
+    CHECK(board->interfaces_text.find("0 HID") != std::string::npos);
+    CHECK(board->interfaces_text.find("2 DFU") != std::string::npos);
+    CHECK(hub_device->hub);
+    CHECK(hub_device->class_summary.find("Hub") != std::string::npos);
+    auto rockusb = std::find_if(devices.begin(), devices.end(), [](const Device &d) { return d.port == "3-5"; });
+    CHECK(rockusb != devices.end());
+    CHECK(rockusb->name == "Rockchip Rockusb");
+    CHECK(rockusb->class_summary == "Rockusb");
+    CHECK(rockusb->interfaces_text == "0 Rockusb");
+    CHECK(rockusb->dfu_interfaces.empty());
+    auto other = std::find_if(devices.begin(), devices.end(), [](const Device &d) { return d.port == "3-6"; });
+    CHECK(other != devices.end());
+    CHECK(other->name == "USB device");
+    CHECK(other->class_summary == "Vendor");
 }
 void pcap_roundtrip_and_validation() {
     TempDir t;
@@ -296,7 +402,9 @@ int main() {
         pcap_roundtrip_and_validation();
         iso_preview_skips_descriptors();
         bulk_counters_exceed_four_gibibytes();
-        std::cout << "9 core scenarios passed\n";
+        recent_latency_and_last_error();
+        mass_storage_command();
+        std::cout << "11 core scenarios passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
         return 1;

@@ -37,9 +37,11 @@ struct Event {
 };
 struct Device {
     std::string port, name, vendor, product, serial, speed;
+    std::string class_summary, interfaces_text;
     int bus{}, address{};
     std::vector<int> dfu_interfaces;
-    bool connected{true};
+    bool connected{true}, hub{};
+    double megabits{};
 };
 std::vector<Device> scan_devices(const std::filesystem::path &root = "/sys/bus/usb/devices");
 std::string human(double value);
@@ -47,14 +49,21 @@ std::string status_name(int status);
 std::string hex_preview(const std::vector<uint8_t> &data, size_t limit = 24);
 std::string decode_setup(const Header &h, const Device *device, int forced_interface = -1);
 std::string decode_dfu_status(const std::vector<uint8_t> &data);
+std::string decode_bot(const std::vector<uint8_t> &data);
+
+inline constexpr size_t rate_samples = 180;
 
 struct Counters {
     uint64_t in{}, out{}, transfers{}, errors{};
     double latency_ms{}, max_latency_ms{};
     uint64_t paired{};
     std::deque<double> in_history, out_history;
-    uint64_t previous_in{}, previous_out{}, previous_transfers{};
+    uint64_t previous_in{}, previous_out{}, previous_transfers{}, previous_errors{}, previous_paired{};
+    double previous_latency_sum{}, pending_window_max{};
+    int pending_error{};
     double in_rate{}, out_rate{}, transfer_rate{};
+    double window_latency_ms{}, window_max_latency_ms{};
+    int last_error{};
     void sample(double seconds);
 };
 struct Transfer {
@@ -63,9 +72,11 @@ struct Transfer {
     std::string port, description, payload;
     int bus{}, address{}, endpoint{}, status{};
     uint32_t length{}, captured{};
-    bool input{}, complete{}, dfu{};
+    bool input{}, complete{}, dfu{}, has_setup{};
     double latency_ms{-1};
     std::string kind;
+    std::vector<uint8_t> bytes;
+    std::array<uint8_t, 8> setup{};
 };
 struct Port {
     Device device;
@@ -90,7 +101,7 @@ class Model {
     Counters total;
     std::deque<Transfer> transfers;
     std::deque<std::string> lifecycle;
-    uint64_t dropped{}, unpaired{}, expired{};
+    uint64_t dropped{}, interval_dropped{}, unpaired{}, expired{};
     int forced_interface{-1};
     void devices(const std::vector<Device> &snapshot, bool initial = false);
     void ingest(const Event &e);

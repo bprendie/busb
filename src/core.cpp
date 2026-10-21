@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -37,16 +38,68 @@ template <class T> void bounded_push(std::deque<T> &q, T value, size_t limit) {
 }
 void count(Counters &c, const Event &e, double latency) {
     ++c.transfers;
-    if (e.h.status < 0)
+    if (e.h.status < 0) {
         ++c.errors;
+        c.pending_error = e.h.status;
+    }
     // Only callback lengths represent actual I/O. S lengths are requested sizes.
     if (e.h.type == 'C')
         (e.input() ? c.in : c.out) += e.h.length;
     if (latency >= 0) {
         c.latency_ms += latency;
         c.max_latency_ms = std::max(c.max_latency_ms, latency);
+        c.pending_window_max = std::max(c.pending_window_max, latency);
         ++c.paired;
     }
+}
+double parse_speed(const std::string &speed) {
+    double value = 0;
+    auto [ptr, ec] = std::from_chars(speed.data(), speed.data() + speed.size(), value);
+    return ec == std::errc{} ? value : 0;
+}
+const char *usb_class_name(int code) {
+    switch (code) {
+    case 0x01:
+        return "Audio";
+    case 0x02:
+        return "CDC";
+    case 0x03:
+        return "HID";
+    case 0x06:
+        return "Image";
+    case 0x07:
+        return "Printer";
+    case 0x08:
+        return "Mass Storage";
+    case 0x09:
+        return "Hub";
+    case 0x0a:
+        return "CDC-Data";
+    case 0x0b:
+        return "Smart Card";
+    case 0x0e:
+        return "Video";
+    case 0x0f:
+        return "Healthcare";
+    case 0x10:
+        return "Audio/Video";
+    case 0xdc:
+        return "Diagnostic";
+    case 0xe0:
+        return "Wireless";
+    case 0xef:
+        return "Misc";
+    case 0xfe:
+        return "Application";
+    case 0xff:
+        return "Vendor";
+    default:
+        return "";
+    }
+}
+void add_unique(std::vector<std::string> &names, const std::string &name) {
+    if (!name.empty() && std::find(names.begin(), names.end(), name) == names.end())
+        names.push_back(name);
 }
 const char *kinds[] = {"ISO", "INTR", "CTRL", "BULK"};
 std::vector<uint8_t> preview_bytes(const Event &e) {
@@ -76,18 +129,50 @@ std::vector<Device> scan_devices(const std::filesystem::path &root) {
         d.name = read_attr(p / "product");
         if (d.name.empty())
             d.name = read_attr(p / "manufacturer");
-        if (d.name.empty())
+        bool named = !d.name.empty();
+        if (!named)
             d.name = "USB device";
         d.serial = read_attr(p / "serial");
         d.speed = read_attr(p / "speed");
+        d.megabits = parse_speed(d.speed);
+        if (number(read_attr(p / "bDeviceClass"), 16) == 0x09)
+            d.hub = true;
+        std::vector<std::string> classes, ifaces;
+        bool rockusb = false;
         for (const auto &iface : std::filesystem::directory_iterator(p, ec)) {
             auto ip = iface.path();
-            if (number(read_attr(ip / "bInterfaceClass"), 16) == 0xfe &&
-                number(read_attr(ip / "bInterfaceSubClass"), 16) == 1) {
-                int n = number(read_attr(ip / "bInterfaceNumber"), 16);
-                if (n >= 0)
-                    d.dfu_interfaces.push_back(n);
-            }
+            int cls = number(read_attr(ip / "bInterfaceClass"), 16);
+            if (cls < 0)
+                continue;
+            int sub = number(read_attr(ip / "bInterfaceSubClass"), 16);
+            int proto = number(read_attr(ip / "bInterfaceProtocol"), 16);
+            int n = number(read_attr(ip / "bInterfaceNumber"), 16);
+            if (cls == 0x09)
+                d.hub = true;
+            bool dfu = cls == 0xfe && sub == 1;
+            if (dfu && n >= 0)
+                d.dfu_interfaces.push_back(n);
+            // U-Boot f_rockusb: class ff, subclass 06, protocol 05. Rockchip calls this DFU.
+            bool rockusb_if = cls == 0xff && sub == 0x06 && proto == 0x05;
+            rockusb = rockusb || rockusb_if;
+            std::string name = dfu ? "DFU" : (rockusb_if ? "Rockusb" : usb_class_name(cls));
+            add_unique(classes, name);
+            if (n >= 0 && !name.empty())
+                ifaces.push_back(std::to_string(n) + " " + name);
+        }
+        if (!named && rockusb)
+            d.name = d.vendor == "2207" ? "Rockchip Rockusb" : "Rockusb " + d.vendor + ":" + d.product;
+        if (d.hub)
+            add_unique(classes, "Hub");
+        for (size_t i = 0; i < classes.size(); ++i) {
+            if (i)
+                d.class_summary += " · ";
+            d.class_summary += classes[i];
+        }
+        for (size_t i = 0; i < ifaces.size(); ++i) {
+            if (i)
+                d.interfaces_text += " · ";
+            d.interfaces_text += ifaces[i];
         }
         result.push_back(std::move(d));
     }
@@ -193,17 +278,69 @@ std::string decode_dfu_status(const std::vector<uint8_t> &data) {
     std::string error = data[0] < 16 ? errors[data[0]] : "status=" + std::to_string(data[0]);
     return state + " " + error + " poll=" + std::to_string(poll) + "ms";
 }
+std::string decode_bot(const std::vector<uint8_t> &data) {
+    if (data.size() < 31)
+        return {};
+    uint32_t signature = uint32_t(data[0]) | (uint32_t(data[1]) << 8) | (uint32_t(data[2]) << 16) |
+                         (uint32_t(data[3]) << 24);
+    if (signature != 0x43425355)
+        return {};
+    unsigned cb_len = data[14];
+    if (cb_len < 1 || cb_len > 16 || data.size() < 15u + cb_len)
+        return {};
+    const uint8_t *cb = data.data() + 15;
+    if ((cb[0] == 0x28 || cb[0] == 0x2a) && cb_len >= 10) {
+        uint32_t lba = (uint32_t(cb[2]) << 24) | (uint32_t(cb[3]) << 16) | (uint32_t(cb[4]) << 8) | cb[5];
+        unsigned blocks = (unsigned(cb[7]) << 8) | cb[8];
+        std::ostringstream out;
+        out << (cb[0] == 0x28 ? "READ(10)" : "WRITE(10)") << " LBA 0x" << std::hex << lba << std::dec << " × "
+            << blocks;
+        return out.str();
+    }
+    switch (cb[0]) {
+    case 0x00:
+        return "TEST UNIT READY";
+    case 0x12:
+        return "INQUIRY";
+    case 0x1a:
+    case 0x5a:
+        return "MODE SENSE";
+    case 0x25:
+        return "READ CAPACITY";
+    case 0x2f:
+        return "VERIFY";
+    default: {
+        std::ostringstream out;
+        out << "SCSI 0x" << std::hex << std::setw(2) << std::setfill('0') << unsigned(cb[0]);
+        return out.str();
+    }
+    }
+}
 void Counters::sample(double seconds) {
     if (seconds <= 0)
         return;
+    auto new_transfers = transfers - previous_transfers;
+    auto new_pairs = paired - previous_paired;
+    auto new_errors = errors - previous_errors;
     in_rate = double(in - previous_in) / seconds;
     out_rate = double(out - previous_out) / seconds;
-    transfer_rate = double(transfers - previous_transfers) / seconds;
+    transfer_rate = double(new_transfers) / seconds;
+    window_latency_ms = new_pairs ? (latency_ms - previous_latency_sum) / double(new_pairs) : 0;
+    window_max_latency_ms = pending_window_max;
+    if (new_errors)
+        last_error = pending_error;
+    else if (new_transfers)
+        last_error = 0;
     previous_transfers = transfers;
     previous_in = in;
     previous_out = out;
-    bounded_push(in_history, in_rate, 180);
-    bounded_push(out_history, out_rate, 180);
+    previous_paired = paired;
+    previous_errors = errors;
+    previous_latency_sum = latency_ms;
+    pending_window_max = 0;
+    pending_error = 0;
+    bounded_push(in_history, in_rate, rate_samples);
+    bounded_push(out_history, out_rate, rate_samples);
 }
 void Model::devices(const std::vector<Device> &snapshot, bool initial) {
     std::map<std::string, Device> present;
@@ -273,9 +410,13 @@ void Model::ingest(const Event &e) {
         port.device.connected = false;
     }
     std::string desc = decode_setup(e.h, &port.device, forced_interface);
-    bool dfu = desc.starts_with("DFU_");
     double latency = -1;
     std::vector<uint8_t> payload = preview_bytes(e);
+    if (desc.empty() && e.h.transfer == 3)
+        desc = decode_bot(payload);
+    bool dfu = desc.starts_with("DFU_");
+    std::array<uint8_t, 8> setup = e.h.setup;
+    bool has_setup = e.h.transfer == 2 && e.h.setup_flag == 0;
     if (e.h.type == 'S') {
         // Keep only enough OUT bytes for the preview; capture recording retains the chosen snaplen.
         Event saved;
@@ -287,9 +428,13 @@ void Model::ingest(const Event &e) {
         const auto &p = found->second;
         desc = p.description;
         dfu = p.dfu;
+        setup = p.event.h.setup;
+        has_setup = p.event.h.transfer == 2 && p.event.h.setup_flag == 0;
         latency = std::max(0.0, (e.timestamp() - p.event.timestamp()) * 1000);
         if (!e.input() && payload.empty())
             payload = p.event.data;
+        if (desc.empty() && e.h.transfer == 3)
+            desc = decode_bot(payload);
         if (dfu && e.h.status == 0 && p.event.h.setup[1] == 3) {
             port.dfu_status = decode_dfu_status(e.data);
             desc += " -> " + port.dfu_status;
@@ -305,6 +450,9 @@ void Model::ingest(const Event &e) {
     t.port = key;
     t.description = desc;
     t.payload = hex_preview(payload);
+    t.bytes = payload;
+    t.setup = setup;
+    t.has_setup = has_setup;
     t.bus = e.h.bus;
     t.address = e.h.device;
     t.endpoint = e.h.endpoint & 15;
@@ -538,6 +686,9 @@ std::vector<Device> demo_devices() {
     d.bus = 1;
     d.address = 7;
     d.dfu_interfaces = {0};
+    d.class_summary = "DFU";
+    d.interfaces_text = "0 DFU";
+    d.megabits = 480;
     Device mouse;
     mouse.port = "1-3";
     mouse.name = "USB mouse (synthetic motion)";
@@ -546,6 +697,9 @@ std::vector<Device> demo_devices() {
     mouse.speed = "12";
     mouse.bus = 1;
     mouse.address = 8;
+    mouse.class_summary = "HID";
+    mouse.interfaces_text = "0 HID";
+    mouse.megabits = 12;
     Device disk;
     disk.port = "1-4";
     disk.name = "USB storage (synthetic reads)";
@@ -554,6 +708,9 @@ std::vector<Device> demo_devices() {
     disk.speed = "5000";
     disk.bus = 1;
     disk.address = 9;
+    disk.class_summary = "Mass Storage";
+    disk.interfaces_text = "0 Mass Storage";
+    disk.megabits = 5000;
     return {d, mouse, disk};
 }
 Recorder::Recorder(const std::string &path) {
